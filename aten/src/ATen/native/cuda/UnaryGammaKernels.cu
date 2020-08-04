@@ -31,8 +31,8 @@ void polygamma_kernel_cuda(TensorIterator& iter, int64_t n) {
     digamma_kernel_cuda(iter);
   }
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(iter.dtype(), "polygamma_cuda", [&]() {
-    gpu_kernel(iter, [] GPU_LAMBDA(scalar_t a) -> scalar_t {
-      return calc_trigamma(a);
+    gpu_kernel(iter, [=] GPU_LAMBDA(scalar_t a) -> scalar_t {
+      return calc_polygamma(int(n), a);
     });
   });
 }
