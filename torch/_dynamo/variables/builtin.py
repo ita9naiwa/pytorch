@@ -1512,6 +1512,12 @@ class BuiltinVariable(BaseBuiltinVariable):
                 # provides call_function dispatch first.
                 method_name = "__eq__" if fn is operator.eq else "__ne__"
                 return args[0].call_method(tx, method_name, list(args[1:]), kwargs)
+            if (
+                fn is operator.getitem
+                and type(args[0]) is TensorVariable
+                and tx.output.export
+            ):
+                return args[0].method___getitem__(tx, args[1])
             proxy = tx.output.create_proxy(
                 "call_function",
                 fn,
