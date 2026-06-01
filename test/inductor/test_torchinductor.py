@@ -1174,9 +1174,9 @@ def is_dynamic_shape_enabled():
 
 
 def target_assert_size_stride_str(
-    name, sizes, strides, dynamic_sizes=None, dynamic_strides=None
+    name, sizes, strides, dynamic_sizes=None, dynamic_strides=None, dtype=None
 ):
-    """Build expected assert_size_stride check string for generated code.
+    """Build expected tensor metadata check string for generated code.
 
     Handles cpp_wrapper ({}/L suffix) vs Python wrapper (()). When dynamic_sizes
     and dynamic_strides are provided, uses them if dynamic shapes are enabled.
@@ -1200,6 +1200,8 @@ def target_assert_size_stride_str(
         size_str = "(" + ", ".join(str(s) for s in sizes) + ")"
         stride_str = "(" + ", ".join(str(s) for s in strides) + ")"
 
+    if name is not None and dtype is not None and not config.cpp_wrapper:
+        return f"assert_tensor_metadata({name}, {size_str}, {stride_str}, {dtype}"
     if name is not None:
         return f"assert_size_stride({name}, {size_str}, {stride_str}"
     return f"{size_str}, {stride_str}"
@@ -9333,6 +9335,30 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ),
         )
 
+    def test_bincount_with_int_weights(self):
+        def fn(x, w):
+            return torch.bincount(x, weights=w, minlength=8)
+
+        self.common(
+            fn,
+            (
+                torch.randint(0, 8, (30,), dtype=torch.int64),
+                torch.arange(30, dtype=torch.int32),
+            ),
+        )
+
+    def test_bincount_empty_with_weights(self):
+        def fn(x, w):
+            return torch.bincount(x, weights=w, minlength=8)
+
+        self.common(
+            fn,
+            (
+                torch.empty(0, dtype=torch.int64),
+                torch.empty(0, dtype=torch.float32),
+            ),
+        )
+
     def test_unique(self):
         # aten._unique2: torch.unique() backend; multi-output with data-dependent size.
         def fn(x):
@@ -16428,10 +16454,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         code = run_and_get_triton_code(f, x)
 
         check1 = target_assert_size_stride_str(
-            "buf1", [16, 32], [32, 1], ["s77", "s27"], ["s27", 1]
+            "buf1",
+            [16, 32],
+            [32, 1],
+            ["s77", "s27"],
+            ["s27", 1],
+            torch.float32,
         )
         check2 = target_assert_size_stride_str(
-            "buf2", [16, 32], [32, 1], ["s77", "s27"], ["s27", 1]
+            "buf2",
+            [16, 32],
+            [32, 1],
+            ["s77", "s27"],
+            ["s27", 1],
+            torch.int64,
         )
         FileCheck().check(check1).check(check2).run(code)
 
