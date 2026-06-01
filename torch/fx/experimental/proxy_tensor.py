@@ -1446,11 +1446,85 @@ class PythonKeyTracer(Tracer):
         # Try reconstructing untracked opaque reference types from existing
         # graph inputs (e.g. derive a DeviceMesh submesh from its root mesh).
         if isinstance(a, (FakeScriptObject, OpaqueBase)):
+            proxy = self._get_tracked_opaque_proxy(a)
+            if proxy is not None:
+                return proxy.node
             node = self._try_reconstruct_opaque(a)
             if node is not None:
                 return node
+            real_obj = self._opaque_real_obj(a)
+            if is_opaque_reference_type(
+                type(real_obj)
+            ) and not self._allow_constant_opaque(real_obj):
+                raise RuntimeError(
+                    f"An untracked reference-type opaque object "
+                    f"({type(real_obj).__name__}) reached FX graph creation. "
+                    "FX would otherwise bake this object into the graph as "
+                    "a get_attr constant with no input guard, which can "
+                    "produce stale or missing objects when the graph is "
+                    "reused. Pass the opaque object as a graph input or "
+                    "make it a module/class attribute, or register a "
+                    "reconstruct_fn that derives it from tracked inputs."
+                )
 
         return super().create_arg(a)  # type: ignore[return-value]
+
+    def _opaque_real_obj(self, a: FakeScriptObject | OpaqueBase) -> OpaqueBase:
+        return a.real_obj if isinstance(a, FakeScriptObject) else a
+
+    def _allow_constant_opaque(self, obj: OpaqueBase) -> bool:
+        # Internal compiler-owned opaque types can opt into FX constants.
+        if getattr(type(obj), "_allow_opaque_fx_constant", False):
+            return True
+        # Some factory ops pass Generator kwargs directly to C++ without
+        # proxy-tracking the corresponding make_fx input.
+        if isinstance(obj, torch.Generator):
+            return True
+        if isinstance(obj, torch.nn.Module):
+            return True
+        return any(
+            value is obj for cls in type(obj).__mro__ for value in cls.__dict__.values()
+        )
+
+    def _get_tracked_opaque_proxy(
+        self, obj: FakeScriptObject | OpaqueBase
+    ) -> Proxy | None:
+        return self._get_tracked_opaque_proxy_impl(obj, allow_equal_real_obj=False)
+
+    def _get_reconstruct_opaque_proxy(self, obj: OpaqueBase) -> Proxy | None:
+        return self._get_tracked_opaque_proxy_impl(obj, allow_equal_real_obj=True)
+
+    def _get_tracked_opaque_proxy_impl(
+        self, obj: FakeScriptObject | OpaqueBase, *, allow_equal_real_obj: bool
+    ) -> Proxy | None:
+        proxy = get_proxy_slot(obj, self, None)
+        if proxy is not None:
+            return proxy
+
+        real_obj = self._opaque_real_obj(obj)
+        proxy = self._opaque_real_obj_proxy.get(id(real_obj))
+        if proxy is not None:
+            return proxy
+
+        if real_obj is not obj:
+            proxy = get_proxy_slot(real_obj, self, None)
+            if proxy is not None:
+                return proxy
+
+        if not allow_equal_real_obj:
+            return None
+
+        # The object may be identity-different but equal to a tracked
+        # FSO's real_obj. This happens because maybe_to_fake_obj creates
+        # a new DeviceMesh wrapper, so the FSO's real_obj is a distinct
+        # object from the one held by submesh._root_mesh. Equality
+        # comparison is needed, not identity.
+        for tracked_obj, p in self.opaque_tracker.items():
+            if not isinstance(tracked_obj, FakeScriptObject):
+                continue
+            if tracked_obj.real_obj == real_obj:
+                return p
+        return None
 
     def _try_reconstruct_opaque(
         self, a: FakeScriptObject | OpaqueBase
@@ -1463,7 +1537,7 @@ class PythonKeyTracer(Tracer):
         from inputs already in the graph.  Returns an FX Node on success,
         None on failure (falls back to get_attr constant).
         """
-        real_obj: OpaqueBase = a.real_obj if isinstance(a, FakeScriptObject) else a
+        real_obj = self._opaque_real_obj(a)
 
         if not is_opaque_reference_type(type(real_obj)):
             return None
@@ -1473,23 +1547,7 @@ class PythonKeyTracer(Tracer):
             return None
 
         def get_tracked_proxy(obj: OpaqueBase) -> Proxy | None:
-            proxy = self._opaque_real_obj_proxy.get(id(obj))
-            if proxy is not None:
-                return proxy
-            proxy = get_proxy_slot(obj, self, None)
-            if proxy is not None:
-                return proxy
-            # The object may be identity-different but equal to a tracked
-            # FSO's real_obj. This happens because maybe_to_fake_obj creates
-            # a new DeviceMesh wrapper, so the FSO's real_obj is a distinct
-            # object from the one held by submesh._root_mesh. Equality
-            # comparison is needed, not identity.
-            for tracked_obj, p in self.opaque_tracker.items():
-                if not isinstance(tracked_obj, FakeScriptObject):
-                    continue
-                if tracked_obj.real_obj == obj:
-                    return p
-            return None
+            return self._get_reconstruct_opaque_proxy(obj)
 
         result = reconstruct_fn(real_obj, get_tracked_proxy, self)
         if result is None:
