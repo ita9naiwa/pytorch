@@ -7173,8 +7173,120 @@ def var_mean_welford_(x, axis, *, correction, keepdim, return_mean):
     return (var,)
 
 
+def var_mean_aten_welford_order_(x, axis, *, correction, keepdim, return_mean):
+    """Match ATen CUDA's low-precision var_mean Welford reduction order."""
+    assert return_mean
+    if correction is None:
+        correction = 1
+
+    kwargs = _make_reduction_inner(
+        x, axis=axis, keepdims=keepdim, dtype=None, override_return_dtype=None
+    )
+    reduction_ranges = kwargs["reduction_ranges"]
+    if len(reduction_ranges) != 1:
+        return None
+    reduction_numel = sympy_product(reduction_ranges)
+    if not isinstance(reduction_numel, sympy.Integer):
+        return None
+    reduction_numel = int(reduction_numel)
+    if reduction_numel < 128 or reduction_numel % 64 != 0:
+        return None
+
+    loader = kwargs["inner_fn"]
+    dtype = x.get_dtype()
+
+    def zero():
+        return ops.constant(0, dtype)
+
+    def const(value):
+        return ops.constant(value, dtype)
+
+    def reduce_one(acc, value):
+        mean, m2, count = acc
+        if count == 0:
+            return value, zero(), 1
+        new_count = count + 1
+        delta = value - mean
+        new_mean = mean + ops.div_rn(delta, const(new_count))
+        return new_mean, m2 + delta * (value - new_mean), new_count
+
+    def combine(lhs, rhs):
+        lhs_mean, lhs_m2, lhs_count = lhs
+        rhs_mean, rhs_m2, rhs_count = rhs
+        if lhs_count == 0:
+            return rhs
+        if rhs_count == 0:
+            return lhs
+        new_count = lhs_count + rhs_count
+        delta = rhs_mean - lhs_mean
+        rhs_count_over_total = ops.div_rn(const(rhs_count), const(new_count))
+        mean_delta = ops.mul_rn(delta, rhs_count_over_total)
+        return (
+            lhs_mean + mean_delta,
+            lhs_m2 + rhs_m2 + delta * delta * const(lhs_count) * rhs_count_over_total,
+            new_count,
+        )
+
+    def compute_welford(index):
+        lane_results = []
+        for lane in range(32):
+            even = (zero(), zero(), 0)
+            odd = (zero(), zero(), 0)
+            offset = lane * 2
+            while offset + 1 < reduction_numel:
+                even = reduce_one(even, loader(index, [sympy.Integer(offset)]))
+                odd = reduce_one(odd, loader(index, [sympy.Integer(offset + 1)]))
+                offset += 64
+            lane_results.append(combine(even, odd))
+
+        offset = 16
+        while offset > 0:
+            for lane in range(offset):
+                lane_results[lane] = combine(
+                    lane_results[lane], lane_results[lane + offset]
+                )
+            offset //= 2
+        return lane_results[0]
+
+    def mean_fn(index):
+        mean, _, _ = compute_welford(index)
+        return mean
+
+    def m2_fn(index):
+        _, m2, _ = compute_welford(index)
+        return m2
+
+    mean = Pointwise.create(
+        device=kwargs["device"],
+        dtype=dtype,
+        inner_fn=mean_fn,
+        ranges=kwargs["ranges"],
+    )
+    m2 = Pointwise.create(
+        device=kwargs["device"],
+        dtype=dtype,
+        inner_fn=m2_fn,
+        ranges=kwargs["ranges"],
+    )
+
+    def scale_fn(data):
+        denominator = max(reduction_numel - correction, 0)
+        return ops.div_rn(data, const(denominator))
+
+    var = make_pointwise(scale_fn)(m2)
+    mean.realize()
+    return var, mean
+
+
 def var_mean_helper_(x, *, axis, correction, keepdim, return_mean):
     out_dtype = x.get_dtype()
+    device = x.get_device()
+    use_aten_welford_order = (
+        return_mean
+        and device is not None
+        and device.type == "cuda"
+        and out_dtype in (torch.float16, torch.bfloat16)
+    )
     compute_dtype = get_computation_dtype(out_dtype)
     x = to_dtype(x, compute_dtype, copy=False)
     kwargs = dict(
@@ -7187,10 +7299,16 @@ def var_mean_helper_(x, *, axis, correction, keepdim, return_mean):
     output = (
         var_mean_sum_(**kwargs)
         if (
-            config.mtia.disable_welford_reduction
-            or use_two_step_variance(x, axis=axis, keepdim=keepdim)
+            not use_aten_welford_order
+            and (
+                config.mtia.disable_welford_reduction
+                or use_two_step_variance(x, axis=axis, keepdim=keepdim)
+            )
         )
-        else var_mean_welford_(**kwargs)
+        else (
+            var_mean_aten_welford_order_(**kwargs) if use_aten_welford_order else None
+        )
+        or var_mean_welford_(**kwargs)
     )
     output = tuple(to_dtype(x, out_dtype, copy=False) for x in output)
     return output[0] if not return_mean else output
